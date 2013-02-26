@@ -39,6 +39,13 @@ class DatabaseManager
     protected $database_dirs = array();
 
     /**
+     * The root directory of the project
+     *
+     * @var string
+     */
+    protected $basedir = null;
+
+    /**
      * De hostname van de database server
      *
      * @var string
@@ -90,12 +97,18 @@ class DatabaseManager
 
     /**
      * Initialization
+     *
+     * @param \Bugbyte\Deployer\Logger\Logger $logger
+     * @param \Bugbyte\Deployer\Shell\Shell $local_shell
+     * @param \Bugbyte\Deployer\Shell\RemoteShell $remote_shell
+     * @param string $basedir
      */
-    public function __construct(Logger $logger, Shell $local_shell, RemoteShell $remote_shell)
+    public function __construct(Logger $logger, Shell $local_shell, RemoteShell $remote_shell, $basedir)
     {
         $this->logger = $logger;
         $this->local_shell = $local_shell;
         $this->remote_shell = $remote_shell;
+        $this->basedir = $basedir;
     }
 
     /**
@@ -197,7 +210,7 @@ class DatabaseManager
             return;
         }
 
-        static::checkDatabaseFiles($this->target, $this->basedir, $files);
+        static::checkDatabaseFiles($this->basedir, $files);
 
         $this->getDatabaseLogin($remote_host);
     }
@@ -217,7 +230,7 @@ class DatabaseManager
             return;
         }
 
-        self::checkDatabaseFiles($this->target, $this->basedir, $files);
+        self::checkDatabaseFiles($this->basedir, $files);
 
         $this->getDatabaseLogin($remote_host, $this->database_host);
 
@@ -264,30 +277,35 @@ class DatabaseManager
         {
             $filepath = $path_prefix .'/'. $filename;
 
-            if (!file_exists($filepath))
+            if (!file_exists($filepath)) {
                 throw new DeployException("$filepath not found");
+            }
 
             $classname = str_replace('.class', '', pathinfo($filename, PATHINFO_FILENAME));
 
             require_once $filepath;
 
-            if (!class_exists($classname))
+            if (!class_exists($classname)) {
                 throw new DeployException("Class $classname not found in $filepath");
+            }
 
             $sql = new $classname();
 
-            if (!$sql instanceof \SQL_update)
+            if (!$sql instanceof \SQL_update) {
                 throw new DeployException("Class $classname doesn't implement SQL_update");
+            }
 
             $up_sql = trim($sql->up());
 
-            if ($up_sql != '' && substr($up_sql, -1) != ';')
+            if ($up_sql != '' && substr($up_sql, -1) != ';') {
                 throw new DeployException("$classname up() code doesn't end with ';'");
+            }
 
             $down_sql = trim($sql->down());
 
-            if ($down_sql != '' && substr($down_sql, -1) != ';')
+            if ($down_sql != '' && substr($down_sql, -1) != ';') {
                 throw new DeployException("$classname down() code doesn't end with ';'");
+            }
 
             $classes[] = $sql;
         }
@@ -302,8 +320,9 @@ class DatabaseManager
      */
     protected function getDatabaseLogin($remote_host)
     {
-        if ($this->database_checked)
+        if ($this->database_checked) {
             return;
+        }
 
         if ($this->database_name !== null) {
             $database_name = $this->local_shell->inputPrompt('Update database '. $this->database_name .' (yes/no): ', 'no');
@@ -334,8 +353,9 @@ class DatabaseManager
             // controleren of deze gebruiker een tabel mag aanmaken (rudimentaire toegangstest)
             $this->sendToDatabase($remote_host, $this->database_host, "echo '". addslashes("CREATE TABLE temp_{$this->current_timestamp} (field1 INT NULL); DROP TABLE temp_{$this->timestamp};") ."'", $output, $return, $database_name, $username, $password);
 
-            if ($return != 0)
+            if ($return != 0) {
                 return $this->getDatabaseLogin($remote_host, $this->database_host);
+            }
 
             $this->logger->log('Database check passed');
         }
@@ -360,8 +380,9 @@ class DatabaseManager
      */
     protected function sendToDatabase($remote_host, $database_host, $command, &$output, &$return, $database_name, $username, $password)
     {
-        if ($this->database_checked && $this->database_name == 'skip')
+        if ($this->database_checked && $this->database_name == 'skip') {
             return;
+        }
 
         $this->remote_shell->sshExec($remote_host, "$command | mysql -h$database_host -u$username -p$password $database_name", $output, $return, '/ -p[^ ]+ /', ' -p***** ');
     }
@@ -391,12 +412,10 @@ class DatabaseManager
 
         $update_files = array();
 
-        foreach ($this->database_dirs as $database_dir)
-        {
+        foreach ($this->database_dirs as $database_dir) {
             $dir = new \DirectoryIterator($database_dir);
 
-            foreach ($dir as $entry)
-            {
+            foreach ($dir as $entry) {
                 /** @var \SplFileInfo|\DirectoryIterator $entry */
 
                 if ($entry->isDot() || !$entry->isFile()) {
@@ -404,11 +423,13 @@ class DatabaseManager
                 }
 
                 if (preg_match('/sql_(\d{8}_\d{6})\.class.php/', $entry->getFilename(), $matches)) {
-                    if (!($timestamp = strtotime(preg_replace('/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/', '$1-$2-$3 $4:$5:$6', $matches[1]))))
+                    if (!($timestamp = strtotime(preg_replace('/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/', '$1-$2-$3 $4:$5:$6', $matches[1])))) {
                         throw new DeployException("Can't convert {$matches[1]} to timestamp");
+                    }
 
-                    if ($timestamp > $starttime && $timestamp < $endtime)
+                    if ($timestamp > $starttime && $timestamp < $endtime) {
                         $update_files[$timestamp] = $entry->getPathname();
+                    }
                 }
             }
         }
@@ -433,6 +454,4 @@ class DatabaseManager
 
         return $update_files;
     }
-
-
 }

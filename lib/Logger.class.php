@@ -60,6 +60,4 @@ class Logger
             error_log($message . PHP_EOL, 3, $this->logfile);
         }
     }
-
-
 }

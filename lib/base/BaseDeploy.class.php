@@ -267,7 +267,7 @@ class BaseDeploy
         $this->remote_shell = new RemoteShell($this->logger, $this->remote_user, isset($options['ssh_path']) ? $options['ssh_path'] : trim(`which ssh`));
 
         // initialize database manager
-        $this->database_manager = new DatabaseManager($this->logger, $this->local_shell, $this->remote_shell);
+        $this->database_manager = new DatabaseManager($this->logger, $this->local_shell, $this->remote_shell, $this->basedir);
 
         if (isset($options['database_dirs'])) {
             $this->database_manager->setDirs($options['database_dirs']);
@@ -402,8 +402,9 @@ class BaseDeploy
 			}
 		}
 
-		if ($action == 'update')
+		if ($action == 'update') {
 			$this->checkFiles(is_array($this->remote_host) ? $this->remote_host[0] : $this->remote_host, $this->remote_dir, $this->last_remote_target_dir);
+        }
 
         $this->database_manager->checkDatabase(is_array($this->remote_host) ? $this->remote_host[0] : $this->remote_host, $action);
 
@@ -415,7 +416,7 @@ class BaseDeploy
 
 		if ($action == 'update') {
 			if (is_array($this->remote_host)) {
-				foreach ($this->remote_host as $key => $remote_host) {
+				foreach ($this->remote_host as $remote_host) {
 					if ($files = $this->listFilesToRename($remote_host, $this->remote_dir)) {
 						$this->logger->log("Target-specific file renames on $remote_host:");
 

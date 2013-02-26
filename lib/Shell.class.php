@@ -16,18 +16,16 @@ class Shell
     {
         fwrite(STDOUT, $message);
 
-        if (!$isPassword)
-        {
+        if (!$isPassword) {
             $input = trim(fgets(STDIN));
-        }
-        else
-        {
+        } else {
             $input = self::getPassword(false);
             echo PHP_EOL;
         }
 
-        if ($input == '')
+        if ($input == '') {
             $input = $default;
+        }
 
         return $input;
     }
