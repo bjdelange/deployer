@@ -1,3 +1,5 @@
 <?php
 
-class DeployException extends Exception {}
+namespace Bugbyte\Deployer\Exceptions;
+
+class DeployException extends \Exception {}
