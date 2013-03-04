@@ -267,7 +267,12 @@ class BaseDeploy
         $this->remote_shell = new RemoteShell($this->logger, $this->remote_user, isset($options['ssh_path']) ? $options['ssh_path'] : trim(`which ssh`));
 
         // initialize database manager
-        $this->database_manager = new DatabaseManager($this->logger, $this->local_shell, $this->remote_shell, $this->basedir);
+        $this->database_manager = new DatabaseManager(
+            $this->logger,
+            $this->local_shell,
+            $this->remote_shell,
+            $this->basedir,
+            is_array($this->remote_host) ? $this->remote_host[0] : $this->remote_host);
 
         if (isset($options['database_dirs'])) {
             $this->database_manager->setDirs($options['database_dirs']);
@@ -406,7 +411,7 @@ class BaseDeploy
 			$this->checkFiles(is_array($this->remote_host) ? $this->remote_host[0] : $this->remote_host, $this->remote_dir, $this->last_remote_target_dir);
         }
 
-        $this->database_manager->checkDatabase(is_array($this->remote_host) ? $this->remote_host[0] : $this->remote_host, $action);
+        $this->database_manager->check($action);
 
 		if (isset($this->apc_deploy_version_template)) {
 			if (!file_exists($this->apc_deploy_version_template)) {
@@ -417,13 +422,15 @@ class BaseDeploy
 		if ($action == 'update') {
 			if (is_array($this->remote_host)) {
 				foreach ($this->remote_host as $remote_host) {
-					if ($files = $this->listFilesToRename($remote_host, $this->remote_dir)) {
-						$this->logger->log("Target-specific file renames on $remote_host:");
+					if (!$files = $this->listFilesToRename($remote_host, $this->remote_dir)) {
+					    continue;
+                    }
 
-						foreach ($files as $filepath => $newpath) {
-							$this->logger->log("  $newpath => $filepath");
-                        }
-					}
+                    $this->logger->log("Target-specific file renames on $remote_host:");
+
+                    foreach ($files as $filepath => $newpath) {
+                        $this->logger->log("  $newpath => $filepath");
+                    }
 				}
 			} else {
 				if ($files = $this->listFilesToRename($this->remote_host, $this->remote_dir)) {
@@ -466,7 +473,7 @@ class BaseDeploy
 			}
 
 			// na de uploads de database prepareren
-			$this->database_manager->updateDatabase($this->remote_host[0], $this->remote_dir, $this->remote_target_dir);
+			$this->database_manager->update($this->remote_dir, $this->remote_target_dir);
 
 			// als de files en database klaarstaan kan de nieuwe versie geactiveerd worden
 			// door de symlinks te updaten en postDeploy te draaien
@@ -479,7 +486,7 @@ class BaseDeploy
 			$this->preDeploy($this->remote_host, $this->remote_dir, $this->remote_target_dir);
 			$this->updateFiles($this->remote_host, $this->remote_dir, $this->remote_target_dir);
 
-			$this->database_manager->updateDatabase($this->remote_host, $this->remote_dir, $this->remote_target_dir);
+			$this->database_manager->update($this->remote_dir, $this->remote_target_dir);
 
 			$this->changeSymlink($this->remote_host, $this->remote_dir, $this->remote_target_dir);
 			$this->postDeploy($this->remote_host, $this->remote_dir, $this->remote_target_dir);
@@ -512,10 +519,8 @@ class BaseDeploy
 				$this->changeSymlink($remote_host, $this->remote_dir, $this->previous_remote_target_dir);
 			}
 
-			// nadat de symlinks zijn teruggedraaid de database terugdraaien
-			if (!empty($this->database_dirs)) {
-				$this->rollbackDatabase($this->remote_host[0], $this->database_host, $this->remote_dir);
-            }
+			// nadat de symlinks zijn teruggedraaid de database terugdraaien (let op dat de huidige versie dat nog moet doen)
+            $this->database_manager->rollback($this->remote_dir, $this->last_remote_target_dir);
 
 			// de caches resetten
 			foreach ($this->remote_host as $key => $remote_host) {
@@ -531,9 +536,8 @@ class BaseDeploy
 			$this->preRollback($this->remote_host, $this->remote_dir, $this->previous_remote_target_dir);
 			$this->changeSymlink($this->remote_host, $this->remote_dir, $this->previous_remote_target_dir);
 
-			if (!empty($this->database_dirs)) {
-				$this->rollbackDatabase($this->remote_host, $this->database_host, $this->remote_dir);
-            }
+            // nadat de symlinks zijn teruggedraaid de database terugdraaien (let op dat de huidige versie dat nog moet doen)
+            $this->database_manager->rollback($this->remote_dir, $this->last_remote_target_dir);
 
 			$this->clearRemoteCaches($this->remote_host, $this->remote_dir, $this->previous_remote_target_dir);
 			$this->postRollback($this->remote_host, $this->remote_dir, $this->previous_remote_target_dir);
@@ -586,7 +590,8 @@ class BaseDeploy
 	 */
 	protected function clearRemoteCaches($remote_host, $remote_dir, $target_dir)
 	{
-		if (!($this->apc_deploy_version_template && $this->apc_deploy_version_path && $this->apc_deploy_setrev_url)) {
+		if (!isset($this->apc_deploy_version_template, $this->apc_deploy_version_path, $this->apc_deploy_setrev_url) ||
+		    !($this->apc_deploy_version_template && $this->apc_deploy_version_path && $this->apc_deploy_setrev_url)) {
 			return;
         }
 
@@ -1057,6 +1062,28 @@ class BaseDeploy
         $this->remote_shell->sshExec($remote_host, $command, &$output, &$return, $hide_pattern, $hide_replacement, $ouput_loglevel);
     }
 
+    /**
+     * For BC
+     * @see DatabaseManager::sendToDatabase()
+     */
+    protected function sendToDatabase($remote_host, $database_host, $command, &$output, &$return, $hide_pattern = '', $hide_replacement = '', $ouput_loglevel = LOG_INFO)
+    {
+        $this->database_manager->sendToDatabase($command, &$output, &$return, $hide_pattern, $hide_replacement, $ouput_loglevel);
+    }
+
+    /**
+     * For BC
+     * @see Logger::log()
+     *
+     * @param $message
+     * @param int $level
+     * @param bool $extra_newline
+     */
+    protected function log($message, $level = LOG_INFO, $extra_newline = false)
+    {
+        $this->logger->log($message, $level, $extra_newline);
+    }
+
 	/**
 	 * Wrapper for rsync command's
 	 *
@@ -1129,50 +1156,5 @@ class BaseDeploy
 		$this->logger->log("postRollback($remote_host, $remote_dir, $target_dir)", LOG_DEBUG);
 
 		$this->restartGearmanWorkers($remote_host, $remote_dir, $target_dir);
-	}
-
-	/**
-	 * Get a password from the shell.
-	 *
-	 * This function works on *nix systems only and requires shell_exec and stty.
-	 *
-	 * @author http://www.dasprids.de/blog/2008/08/22/getting-a-password-hidden-from-stdin-with-php-cli
-	 * @param  boolean $stars Wether or not to output stars for given characters
-	 * @return string
-	 */
-	static protected function getPassword($stars = false)
-	{
-		// Get current style
-		$oldStyle = shell_exec('stty -g');
-
-		if ($stars === false) {
-			shell_exec('stty -echo');
-			$password = rtrim(fgets(STDIN), "\n");
-		} else {
-			shell_exec('stty -icanon -echo min 1 time 0');
-
-			$password = '';
-			while (true) {
-				$char = fgetc(STDIN);
-
-				if ($char === "\n") {
-					break;
-				} else if (ord($char) === 127) {
-					if (strlen($password) > 0) {
-						fwrite(STDOUT, "\x08 \x08");
-						$password = substr($password, 0, -1);
-					}
-				} else {
-					fwrite(STDOUT, "*");
-					$password .= $char;
-				}
-			}
-		}
-
-		// Reset old style
-		shell_exec('stty ' . $oldStyle);
-
-		// Return the password
-		return $password;
 	}
 }

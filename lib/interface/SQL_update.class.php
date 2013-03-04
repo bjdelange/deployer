@@ -1,5 +1,7 @@
 <?php
 
+// not namespaced for BC
+
 /**
  * Alle SQL updates dienen deze interface te implementeren (om up() en down() te verplichten).
  * Een voorbeeld van zo'n class:

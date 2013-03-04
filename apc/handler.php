@@ -11,6 +11,7 @@ if (($rev = apc_fetch($deployment_key)) != DEPLOY_VERSION) {
         apc_store($deployment_key, DEPLOY_VERSION);
 }
 
+// do the same check for every thread so it'll work for php-fpm too
 $deployment_pid_key = 'php.pid_'.getmypid();
 
 if (($rev = apc_fetch($deployment_pid_key)) != DEPLOY_VERSION) {

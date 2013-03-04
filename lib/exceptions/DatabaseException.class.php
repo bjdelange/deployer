@@ -4,4 +4,4 @@ namespace Bugbyte\Deployer\Exceptions;
 
 use Exception;
 
-class DeployException extends Exception {}
+class DatabaseException extends Exception {}

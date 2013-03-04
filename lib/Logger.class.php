@@ -19,6 +19,13 @@ class Logger
     protected $logfile = null;
 
     /**
+     * A switch to (temporarily) disable output
+     *
+     * @var bool
+     */
+    protected $quiet = false;
+
+    /**
      * Initialization
      *
      * @param string $logfile
@@ -48,7 +55,7 @@ class Logger
             $message = implode(PHP_EOL, $message);
         }
 
-        if ($level == LOG_INFO || ($this->debug && $level == LOG_DEBUG)) {
+        if (!$this->quiet && ($level == LOG_INFO || ($this->debug && $level == LOG_DEBUG))) {
             echo $message . PHP_EOL;
 
             if ($extra_newline) {
@@ -59,5 +66,20 @@ class Logger
         if ($this->logfile) {
             error_log($message . PHP_EOL, 3, $this->logfile);
         }
+    }
+
+    /**
+     * Enable/disable output suppression
+     *
+     * @param boolean $quiet
+     * @return boolean          The previous setting
+     */
+    public function setQuiet($quiet)
+    {
+        $return = $this->quiet;
+
+        $this->quiet = $quiet;
+
+        return $return;
     }
 }

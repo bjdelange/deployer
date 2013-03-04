@@ -3,6 +3,7 @@
 namespace Bugbyte\Deployer\Database;
 
 use Bugbyte\Deployer\Exceptions\DeployException;
+use Bugbyte\Deployer\Exceptions\DatabaseException;
 use Bugbyte\Deployer\Shell\Shell;
 use Bugbyte\Deployer\Shell\RemoteShell;
 use Bugbyte\Deployer\Logger\Logger;
@@ -46,7 +47,21 @@ class DatabaseManager
     protected $basedir = null;
 
     /**
-     * De hostname van de database server
+     * The relative path to the deployer's sql_updates directory
+     *
+     * @var string
+     */
+    protected $sql_updates_path = null;
+
+    /**
+     * The hostname of the server that sends commands to the database server
+     *
+     * @var string
+     */
+    protected $control_host = null;
+
+    /**
+     * The hostname of the database server
      *
      * @var string
      */
@@ -96,19 +111,45 @@ class DatabaseManager
     protected $last_timestamp = null;
 
     /**
+     * Indicates if the old patches behavior (timestamps) should be used instead of the new behavior (check against db_patches table).
+     * This is enabled automatically if the target database has no db_patches table.
+     *
+     * @var bool
+     */
+    protected $patches_table_exists = false;
+
+    /**
+     * A list of all patches that should just be registered as done in db_patches without being applied.
+     *
+     * @var array               [timestamp => filepath, ...]
+     */
+    protected $patches_to_register_as_done = array();
+
+    /**
+     * A list of the patches to apply (used for both update and rollback)
+     *
+     * @var \SQL_update[]       With their full relative paths as keys
+     */
+    protected $patches_to_apply = array();
+
+    /**
      * Initialization
      *
      * @param \Bugbyte\Deployer\Logger\Logger $logger
      * @param \Bugbyte\Deployer\Shell\Shell $local_shell
      * @param \Bugbyte\Deployer\Shell\RemoteShell $remote_shell
      * @param string $basedir
+     * @param string $control_host
      */
-    public function __construct(Logger $logger, Shell $local_shell, RemoteShell $remote_shell, $basedir)
+    public function __construct(Logger $logger, Shell $local_shell, RemoteShell $remote_shell, $basedir, $control_host)
     {
         $this->logger = $logger;
         $this->local_shell = $local_shell;
         $this->remote_shell = $remote_shell;
         $this->basedir = $basedir;
+        $this->control_host = $control_host;
+
+        $this->sql_updates_path = str_replace($this->basedir .'/', '', realpath(__DIR__ .'/../sql_updates'));
     }
 
     /**
@@ -128,6 +169,13 @@ class DatabaseManager
      */
     public function setDirs(array $dirs)
     {
+        // add the directory of the deployer's own patches
+        $deployer_dir = $this->sql_updates_path;
+
+        if (!in_array($deployer_dir, $dirs)) {
+            $dirs[] = $deployer_dir;
+        }
+
         $this->database_dirs = $dirs;
     }
 
@@ -186,12 +234,34 @@ class DatabaseManager
     }
 
     /**
-     * Voert database migraties uit voor de nieuwste upload
+     * Checks for the existence of the table db_patches
      *
-     * @param string $remote_host
-     * @param string $action             update of rollback
+     * @return bool
      */
-    public function checkDatabase($remote_host, $action)
+    protected function patchTableExists()
+    {
+        $output = array();
+        $return = 0;
+
+        $this->query("SHOW TABLES LIKE 'db_patches'", $output, $return);
+
+        if ($return == 0 && !empty($output)) {
+            $this->logger->log('Check if db_patches exists.. yes.', LOG_INFO);
+            return true;
+        }
+
+        // db_patches table doesn't exist
+        $this->logger->log('Check if db_patches exists.. no.', LOG_INFO);
+        return false;
+    }
+
+    /**
+     * Performs database migrations
+     *
+     * @param string $action             update of rollback
+     * @throws \Bugbyte\Deployer\Exceptions\DeployException
+     */
+    public function check($action)
     {
         $this->logger->log('Database updates:', LOG_INFO, true);
 
@@ -199,141 +269,237 @@ class DatabaseManager
             return;
         }
 
-        if ($action == 'update') {
-            $files = $this->findSQLFilesForPeriod($this->last_timestamp, $this->current_timestamp);
-        }
-        elseif ($action == 'rollback') {
-            $files = $this->findSQLFilesForPeriod($this->last_timestamp, $this->previous_timestamp);
+        // collect and verify the database login information so the db_patches table can be checked
+        $this->getDatabaseLogin(true);
+
+        $this->patches_table_exists = $this->patchTableExists();
+
+        // make a list of all available patches
+        $all_patches = $this->findSQLFilesForPeriod(25300, time(), true);
+
+        if (!$this->patches_table_exists) {
+            // old school: select the patches whose timestamps lie between the previous and current deployment timestamps
+            if ($action == 'update') {
+                $files = $this->findSQLFilesForPeriod($this->last_timestamp, $this->current_timestamp);
+
+                // add the patchfile that creates the db_patcher table
+                if (!isset($files[25200])) {
+                    $files[25200] = $this->sql_updates_path .'/sql_19700101_080000.class.php';
+                }
+            }
+            elseif ($action == 'rollback') {
+                $files = $this->findSQLFilesForPeriod($this->last_timestamp, $this->previous_timestamp);
+            }
+        } else {
+            // get the list of all performed patches from the database
+            $patches = $this->findPerformedSQLPatches();
+
+            if (!empty($patches['crashed_update'])) {
+                throw new DeployException("Patch(es) ". implode(', ', $patches['crashed_update']) ." have crashed at previous deploy !");
+            }
+
+            if (!empty($patches['crashed_rollback'])) {
+                throw new DeployException("Patch(es) ". implode(', ', $patches['crashed_rollback']) ." have crashed at previous rollback !");
+            }
+
+            $applied_patches = $patches['applied'];
+
+            if ($action == 'update') {
+                // find the patches that have not yet been performed
+                $files = array_diff_key($all_patches, $applied_patches);
+
+                ksort($files);
+            }
+            elseif ($action == 'rollback') {
+                // find the patches that have been performed on the previous deploy
+                $files = $this->findPerformedSQLPatchesFromPeriod($this->last_timestamp, $this->previous_timestamp);
+            }
         }
 
-        if (!isset($files) || !$files) {
+        if (!$this->patches_table_exists) {
+            // make a list of all patches that are not a part of this commit (pre-existing) but should be registered as applied
+            $patches_to_register_as_done = array();
+
+            foreach ($all_patches as $timestamp => $filename) {
+                if (!array_key_exists($timestamp, $files)) {
+                    $patches_to_register_as_done[$timestamp] = $filename;
+                }
+            }
+        }
+
+        if ((!isset($files) || empty($files)) && (!isset($patches_to_register_as_done) || empty($patches_to_register_as_done))) {
             return;
         }
 
-        static::checkDatabaseFiles($this->basedir, $files);
+        Helper::checkFiles($this->basedir, $files);
 
-        $this->getDatabaseLogin($remote_host);
+        ksort($files, SORT_NUMERIC);
+
+        if ($action == 'update') {
+            $action_to_perform = 'Database patches to apply';
+            $question_to_ask = 'Apply database patches?';
+        } else {
+            $action_to_perform = 'Database patches to revert';
+            $question_to_ask = 'Rollback database patches?';
+        }
+
+        $this->logger->log("$action_to_perform: ". PHP_EOL . implode(PHP_EOL, $files));
+
+        if ($this->local_shell->inputPrompt("$question_to_ask (yes/no): ", 'no') == 'yes') {
+            $this->patches_to_apply = $files;
+        }
+
+        if (isset($patches_to_register_as_done) && !empty($patches_to_register_as_done)) {
+            if ($this->local_shell->inputPrompt('Register the other '. count($patches_to_register_as_done) .' patches as done? (yes/no): ', 'no') == 'yes') {
+                $this->patches_to_register_as_done = $patches_to_register_as_done;
+            }
+        }
+
+        $this->getDatabaseLogin();
+    }
+
+    /**
+     * Returns all patches that have already been applied, crashed when being applied or crashed when begin reverted
+     *
+     * @return array  ['applied' => array(..), 'crashed_update' => array(..), 'crashed_rollback' => array(..)]
+     */
+    protected function findPerformedSQLPatches()
+    {
+        $list = array('applied' => array(), 'crashed_update' => array(), 'crashed_rollback' => array());
+
+        $output = array();
+
+        $this->query('SELECT patch_name, UNIX_TIMESTAMP(applied_at), UNIX_TIMESTAMP(reverted_at) FROM db_patches ORDER BY patch_timestamp', $output);
+
+        foreach ($output as $patch_record) {
+            list($patch_name, $applied_at, $reverted_at) = explode("\t", $patch_record);
+
+            if ($applied_at == 'NULL') {
+                $list['crashed_update'][] = $patch_name;
+            }
+            elseif ($reverted_at != 'NULL') {
+                $list['crashed_rollback'][] = $patch_name;
+            }
+            else {
+                $list['applied'][$applied_at] = $patch_name;
+            }
+        }
+
+        return $list;
+    }
+
+    /**
+     * Make a list of all database patches applied within a timeframe.
+     *
+     * @param integer $latest_timestamp
+     * @param integer $previous_timestamp
+     * @return array
+     */
+    protected function findPerformedSQLPatchesFromPeriod($latest_timestamp, $previous_timestamp)
+    {
+        $list = array();
+        $output = array();
+
+        $this->query("SELECT patch_name, UNIX_TIMESTAMP(applied_at) FROM db_patches ".
+                     "WHERE applied_at BETWEEN FROM_UNIXTIME($previous_timestamp) AND FROM_UNIXTIME($latest_timestamp) ".
+                     "ORDER BY patch_timestamp", $output);
+
+        foreach ($output as $patch_record) {
+            list($patch_name, $applied_at) = explode("\t", $patch_record);
+
+            $list[$applied_at] = $patch_name;
+        }
+
+        return $list;
     }
 
     /**
      * Voert database migraties uit voor de nieuwste upload
      *
-     * @param string $remote_host
      * @param string $remote_dir
      * @param string $target_dir
      */
-    public function updateDatabase($remote_host, $remote_dir, $target_dir)
+    public function update($remote_dir, $target_dir)
     {
         $this->logger->log('updateDatabase', LOG_DEBUG);
 
-        if (!($files = $this->findSQLFilesForPeriod($this->last_timestamp, $this->current_timestamp))) {
+        if (!$this->database_checked || empty($this->patches_to_apply)) {
             return;
         }
 
-        self::checkDatabaseFiles($this->basedir, $files);
+        $this->sendToDatabase(
+            "cd $remote_dir/{$target_dir}; php {$this->database_patcher} update {$this->database_name} {$this->current_timestamp} ". implode(' ', $this->patches_to_apply)
+        );
 
-        $this->getDatabaseLogin($remote_host, $this->database_host);
+        if (!empty($this->patches_to_register_as_done)) {
+            $sql = '';
 
-        $output = array();
-        $return = null;
-        $this->sendToDatabase($remote_host, $this->database_host, "cd $remote_dir/{$target_dir}; php {$this->database_patcher} update {$this->database_name} ". implode(' ', $files), $output, $return, $this->database_name, $this->database_user, $this->database_pass);
+            foreach ($this->patches_to_register_as_done as $timestamp => $filepath) {
+                if ($sql != '') {
+                    $sql .= ', ';
+                }
+
+                $sql .= "('$filepath', $timestamp, FROM_UNIXTIME($timestamp))";
+            }
+
+            $this->query("INSERT INTO db_patches (patch_name, patch_timestamp, applied_at) VALUES $sql;");
+        }
     }
 
     /**
      * Reverts database migrations to the previous deployment
      *
-     * @param string $remote_host
-     * @param string $database_host
      * @param string $remote_dir
+     * @param string $previous_target_dir
      */
-    public function rollbackDatabase($remote_host, $database_host, $remote_dir)
+    public function rollback($remote_dir, $previous_target_dir)
     {
         $this->logger->log('rollbackDatabase', LOG_DEBUG);
 
-        if (!($files = $this->findSQLFilesForPeriod($this->last_timestamp, $this->previous_timestamp))) {
+        if (!$this->database_checked || empty($this->patches_to_apply)) {
             return;
         }
 
-        self::checkDatabaseFiles($this->basedir, $files);
-
-        $this->getDatabaseLogin($remote_host, $database_host);
-
-        $this->sendToDatabase($remote_host, $database_host, "cd $remote_dir/{$this->last_remote_target_dir}; php {$this->database_patcher} rollback ". implode(' ', $files), $output, $return, $this->database_name, $this->database_user, $this->database_pass);
-    }
-
-    /**
-     * Controleert of alle opgegeven bestanden bestaan en de juist class en sql code bevatten
-     *
-     * @param string $path_prefix
-     * @param array $filenames
-     * @throws DeployException
-     * @return array				De absolute paden van alle files
-     */
-    static public function checkDatabaseFiles($path_prefix, $filenames)
-    {
-        $classes = array();
-
-        foreach ($filenames as $filename)
-        {
-            $filepath = $path_prefix .'/'. $filename;
-
-            if (!file_exists($filepath)) {
-                throw new DeployException("$filepath not found");
-            }
-
-            $classname = str_replace('.class', '', pathinfo($filename, PATHINFO_FILENAME));
-
-            require_once $filepath;
-
-            if (!class_exists($classname)) {
-                throw new DeployException("Class $classname not found in $filepath");
-            }
-
-            $sql = new $classname();
-
-            if (!$sql instanceof \SQL_update) {
-                throw new DeployException("Class $classname doesn't implement SQL_update");
-            }
-
-            $up_sql = trim($sql->up());
-
-            if ($up_sql != '' && substr($up_sql, -1) != ';') {
-                throw new DeployException("$classname up() code doesn't end with ';'");
-            }
-
-            $down_sql = trim($sql->down());
-
-            if ($down_sql != '' && substr($down_sql, -1) != ';') {
-                throw new DeployException("$classname down() code doesn't end with ';'");
-            }
-
-            $classes[] = $sql;
-        }
-
-        return $classes;
+        $this->sendToDatabase(
+            "cd $remote_dir/{$previous_target_dir}; php {$this->database_patcher} rollback {$this->database_name} {$this->current_timestamp} ". implode(' ', $this->patches_to_apply)
+        );
     }
 
     /**
      * Prompt the user to enter the database name, login and password to use on the remote server for executing the database patches.
      *
-     * @param string $remote_host
+     * @param bool $pre_check       If this is just a check to access te database (to check the db_patches table) or asking for confirmation to send the changes
      */
-    protected function getDatabaseLogin($remote_host)
+    protected function getDatabaseLogin($pre_check = false)
     {
         if ($this->database_checked) {
             return;
         }
 
-        if ($this->database_name !== null) {
-            $database_name = $this->local_shell->inputPrompt('Update database '. $this->database_name .' (yes/no): ', 'no');
+        $database_name = $this->database_name;
 
-            if ($database_name == 'yes') {
-                $database_name = $this->database_name;
-            } else {
+        // if the database credentials are known, no need to ask for them again
+        if ($database_name === null) {
+            $update_database = $this->local_shell->inputPrompt('Check if database needs updates? (yes/no): ', 'no');
+
+            if ($update_database != 'yes') {
                 $database_name = 'skip';
             }
-        } else {
-            $database_name = $this->local_shell->inputPrompt('Database [skip]: ', 'skip');
+        }
+
+        if ($database_name != 'skip') {
+            if ($this->database_name !== null) {
+                // we're not updating anything yet, so no need to ask questions
+                if (!$pre_check) {
+                    $update_database = $this->local_shell->inputPrompt('Update database '. $this->database_name .'? (yes/no): ', 'no');
+
+                    if ($update_database != 'yes') {
+                        $database_name = 'skip';
+                    }
+                }
+            } else {
+                $database_name = $this->local_shell->inputPrompt('Database name [skip]: ', 'skip');
+            }
         }
 
         if ($database_name == '' || $database_name == 'no') {
@@ -350,11 +516,14 @@ class DatabaseManager
             $username = $this->database_user !== null ? $this->database_user : $this->local_shell->inputPrompt('Database username [root]: ', 'root');
             $password = $this->database_pass !== null ? $this->database_pass : $this->local_shell->inputPrompt('Database password: ', '', true);
 
+            $return = 0;
+            $output = array();
+
             // controleren of deze gebruiker een tabel mag aanmaken (rudimentaire toegangstest)
-            $this->sendToDatabase($remote_host, $this->database_host, "echo '". addslashes("CREATE TABLE temp_{$this->current_timestamp} (field1 INT NULL); DROP TABLE temp_{$this->timestamp};") ."'", $output, $return, $database_name, $username, $password);
+            $this->query("CREATE TABLE `temp_{$this->current_timestamp}` (`field1` INT NULL); DROP TABLE `temp_{$this->current_timestamp}`;", $output, $return, $database_name, $username, $password);
 
             if ($return != 0) {
-                return $this->getDatabaseLogin($remote_host, $this->database_host);
+                return $this->getDatabaseLogin();
             }
 
             $this->logger->log('Database check passed');
@@ -369,22 +538,83 @@ class DatabaseManager
     /**
      * Send a query to the database.
      *
-     * @param string $remote_host
-     * @param string $database_host
      * @param string $command
      * @param array $output
      * @param integer $return
      * @param string $database_name
      * @param string $username
      * @param string $password
+     * @throws \Bugbyte\Deployer\Exceptions\DatabaseException
      */
-    protected function sendToDatabase($remote_host, $database_host, $command, &$output, &$return, $database_name, $username, $password)
+    public function sendToDatabase($command, &$output = array(), &$return = 0, $database_name = null, $username = null, $password = null)
     {
         if ($this->database_checked && $this->database_name == 'skip') {
             return;
         }
 
-        $this->remote_shell->sshExec($remote_host, "$command | mysql -h$database_host -u$username -p$password $database_name", $output, $return, '/ -p[^ ]+ /', ' -p***** ');
+        if ($database_name === null) {
+            $database_name = $this->database_name;
+        }
+
+        if ($username === null) {
+            $username = $this->database_user;
+        }
+
+        if ($password === null) {
+            $password = $this->database_pass;
+        }
+
+        $this->remote_shell->sshExec(
+            $this->control_host,
+            "$command | mysql -h{$this->database_host} -u$username -p$password $database_name", $output, $return, '/ -p[^ ]+ /', ' -p***** '
+        );
+
+        if ($return !== 0) {
+            throw new DatabaseException('Database interaction failed !');
+        }
+    }
+
+    /**
+     * Wrapper for sendToDatabase() to send plain commands to the database
+     *
+     * @param string$command
+     * @param array $output
+     * @param int $return
+     * @param string $database_name
+     * @param string $username
+     * @param string $password
+     * @throws \Bugbyte\Deployer\Exceptions\DatabaseException
+     */
+    public function query($command, &$output = array(), &$return = 0, $database_name = null, $username = null, $password = null)
+    {
+        if ($this->database_checked && $this->database_name == 'skip') {
+            return;
+        }
+
+        if ($database_name === null) {
+            $database_name = $this->database_name;
+        }
+
+        if ($username === null) {
+            $username = $this->database_user;
+        }
+
+        if ($password === null) {
+            $password = $this->database_pass;
+        }
+
+        $command = str_replace(array(/*'(', ')',*/ '`'), array(/*'\(', '\)',*/ '\`'), $command);
+        $command = escapeshellarg($command);
+
+        $this->remote_shell->sshExec(
+            $this->control_host,
+            "mysql -h{$this->database_host} -u$username -p$password -e $command $database_name",
+            $output, $return, '/ -p[^ ]+ /', ' -p***** '
+        );
+
+        if ($return !== 0) {
+            throw new DatabaseException('Database interaction failed !');
+        }
     }
 
     /**
@@ -394,12 +624,20 @@ class DatabaseManager
      *
      * @param integer $starttime (timestamp)
      * @param integer $endtime (timestamp)
+     * @param boolean $quiet
      * @throws DeployException
      * @return array
      */
-    public function findSQLFilesForPeriod($starttime, $endtime)
+    public function findSQLFilesForPeriod($starttime, $endtime, $quiet = false)
     {
+        $previous_quiet = $this->logger->setQuiet($quiet);
+
         $this->logger->log('findSQLFilesForPeriod('. date('Y-m-d H:i:s', $starttime) .','. date('Y-m-d H:i:s', $endtime) .')', LOG_DEBUG);
+
+        if (empty($this->database_dirs)) {
+            $this->logger->setQuiet($previous_quiet);
+            return array();
+        }
 
         $reverse = $starttime > $endtime;
 
@@ -423,9 +661,7 @@ class DatabaseManager
                 }
 
                 if (preg_match('/sql_(\d{8}_\d{6})\.class.php/', $entry->getFilename(), $matches)) {
-                    if (!($timestamp = strtotime(preg_replace('/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/', '$1-$2-$3 $4:$5:$6', $matches[1])))) {
-                        throw new DeployException("Can't convert {$matches[1]} to timestamp");
-                    }
+                    $timestamp = Helper::convertFilenameToTimestamp($entry->getFilename());
 
                     if ($timestamp > $starttime && $timestamp < $endtime) {
                         $update_files[$timestamp] = $entry->getPathname();
@@ -440,17 +676,25 @@ class DatabaseManager
             if (!$reverse) {
                 ksort($update_files, SORT_NUMERIC);
 
-                $this->logger->log($count_files .' SQL update patch'. ($count_files > 1 ? 'es' : '') .' between '. date('Y-m-d H:i:s', $starttime) .' and '. date('Y-m-d H:i:s', $endtime) .':');
+                if (!$quiet) {
+                    $this->logger->log($count_files .' SQL update patch'. ($count_files > 1 ? 'es' : '') .' between '. date('Y-m-d H:i:s', $starttime) .' and '. date('Y-m-d H:i:s', $endtime) .':');
+                }
             } else {
                 krsort($update_files, SORT_NUMERIC);
 
-                $this->logger->log($count_files .' SQL rollback patch'. ($count_files > 1 ? 'es' : '') .' between '. date('Y-m-d H:i:s', $starttime) .' and '. date('Y-m-d H:i:s', $endtime) .':');
+                if (!$quiet) {
+                    $this->logger->log($count_files .' SQL rollback patch'. ($count_files > 1 ? 'es' : '') .' between '. date('Y-m-d H:i:s', $starttime) .' and '. date('Y-m-d H:i:s', $endtime) .':');
+                }
             }
 
             $this->logger->log($update_files);
         } else {
-            $this->logger->log('No SQL patches between '. date('Y-m-d H:i:s', $starttime) .' and '. date('Y-m-d H:i:s', $endtime));
+            if (!$quiet) {
+                $this->logger->log('No SQL patches between '. date('Y-m-d H:i:s', $starttime) .' and '. date('Y-m-d H:i:s', $endtime));
+            }
         }
+
+        $this->logger->setQuiet($previous_quiet);
 
         return $update_files;
     }

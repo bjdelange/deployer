@@ -48,7 +48,7 @@ class RemoteShell
      * @param string $hide_replacement
      * @param int $ouput_loglevel
      */
-    public function sshExec($remote_host, $command, &$output, &$return, $hide_pattern = '', $hide_replacement = '', $ouput_loglevel = LOG_INFO)
+    public function sshExec($remote_host, $command, &$output = array(), &$return = 0, $hide_pattern = '', $hide_replacement = '', $ouput_loglevel = LOG_INFO)
     {
         $cmd = $this->ssh_path .' '. $this->remote_user .'@'. $remote_host .' "'. str_replace('"', '\"', $command) .'"';
 
@@ -61,5 +61,8 @@ class RemoteShell
         $this->logger->log('sshExec: '. $show_cmd, $ouput_loglevel);
 
         exec($cmd, $output, $return);
+
+        // remove some garbage returned on the first line
+        array_shift($output);
     }
 }
